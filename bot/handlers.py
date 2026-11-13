@@ -18,15 +18,19 @@ from bot.hh_parser import (
     fetch_hh_resume,
     fetch_hh_vacancy,
 )
-from bot.storage import InMemoryResumeStorage
+from bot.storage import PostgresResumeStorage
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
 NEW_USER_WELCOME = (
-    "Привет. Я - помощник для составления сопроводительного письма.\n\n"
-    "Для начала отправьте мне ваше резюме одним файлом (PDF, DOCX или TXT), текстом или ссылкой на резюме hh.ru.\n"
+    "Привет! Я помогу составить персонализированное сопроводительное письмо "
+    "под вакансии с hh.ru без лишней воды.\n\n"
+    "Для начала отправьте мне ваше резюме одним из способов:\n"
+    "• файлом (PDF, DOCX или TXT)\n"
+    "• обычным текстовым сообщением\n"
+    "• ссылкой на резюме на hh.ru\n\n"
     "После этого просто присылайте ссылки на интересующие вакансии с hh.ru.\n"
     "Чтобы позже обновить резюме, используйте команду /reset."
 )
@@ -52,19 +56,24 @@ def _split_long_message(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> l
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, storage: InMemoryResumeStorage) -> None:
+async def cmd_start(message: Message, storage: PostgresResumeStorage) -> None:
     if not message.from_user:
         return
 
     user_id = message.from_user.id
-    existing = await storage.get(user_id)
+    try:
+        existing = await storage.get(user_id)
+    except Exception:
+        logger.exception("Database error in /start for user %s", user_id)
+        await message.answer("Не удалось обратиться к базе данных. Попробуйте чуть позже.")
+        return
 
     if existing is None:
         await message.answer(NEW_USER_WELCOME)
         return
 
     await message.answer(
-        f"У вас уже сохранено резюме в памяти ({existing.source_label}, "
+        f"У вас уже сохранено резюме ({existing.source_label}, "
         f"{len(existing.text)} симв.).\n\n"
         "Отправьте ссылку на вакансию с hh.ru — я подготовлю сопроводительное письмо.\n"
         "Если нужно заменить резюме, отправьте команду /reset."
@@ -86,11 +95,17 @@ async def cmd_help(message: Message) -> None:
 
 
 @router.message(Command("status"))
-async def cmd_status(message: Message, storage: InMemoryResumeStorage) -> None:
+async def cmd_status(message: Message, storage: PostgresResumeStorage) -> None:
     if not message.from_user:
         return
 
-    record = await storage.get(message.from_user.id)
+    try:
+        record = await storage.get(message.from_user.id)
+    except Exception:
+        logger.exception("Database error in /status for user %s", message.from_user.id)
+        await message.answer("Ошибка при чтении резюме из базы данных. Попробуйте позже.")
+        return
+
     if record is None:
         await message.answer(
             "Резюме сейчас не сохранено. Отправьте файл (PDF, DOCX, TXT), "
@@ -102,21 +117,27 @@ async def cmd_status(message: Message, storage: InMemoryResumeStorage) -> None:
     if len(record.text) > 250:
         preview += "..."
     await message.answer(
-        f"Резюме в памяти: {record.source_label} ({len(record.text)} симв.)\n"
+        f"Сохранённое резюме: {record.source_label} ({len(record.text)} симв.)\n"
         f"Фрагмент: {preview}\n\n"
         "Отправьте ссылку на вакансию hh.ru для генерации письма или /reset для сброса."
     )
 
 
 @router.message(Command("reset", "update", "clear", "new"))
-async def cmd_reset(message: Message, storage: InMemoryResumeStorage) -> None:
+async def cmd_reset(message: Message, storage: PostgresResumeStorage) -> None:
     if not message.from_user:
         return
 
-    removed = await storage.delete(message.from_user.id)
+    try:
+        removed = await storage.delete(message.from_user.id)
+    except Exception:
+        logger.exception("Database error in /reset for user %s", message.from_user.id)
+        await message.answer("Не удалось удалить резюме из базы данных. Попробуйте позже.")
+        return
+
     if removed:
         await message.answer(
-            "Текущее резюме удалено из памяти.\n"
+            "Текущее резюме удалено.\n"
             "Отправьте новое резюме файлом (PDF, DOCX, TXT), текстом или ссылкой на hh.ru."
         )
     else:
@@ -130,17 +151,22 @@ async def cmd_reset(message: Message, storage: InMemoryResumeStorage) -> None:
 async def handle_document(
     message: Message,
     bot: Bot,
-    storage: InMemoryResumeStorage,
+    storage: PostgresResumeStorage,
     settings: Settings,
 ) -> None:
     if not message.from_user or not message.document:
         return
 
     user_id = message.from_user.id
-    if await storage.has_resume(user_id):
-        await message.answer(
-            "У вас уже есть сохранённое резюме. Чтобы загрузить новое, сначала сбросьте текущее командой /reset."
-        )
+    try:
+        if await storage.has_resume(user_id):
+            await message.answer(
+                "У вас уже есть сохранённое резюме. Чтобы загрузить новое, сначала сбросьте текущее командой /reset."
+            )
+            return
+    except Exception:
+        logger.exception("Database error checking resume for user %s", user_id)
+        await message.answer("Ошибка при обращении к базе данных. Попробуйте позже.")
         return
 
     doc = message.document
@@ -164,15 +190,22 @@ async def handle_document(
         await message.answer("Не удалось обработать файл. Попробуйте другой формат или вставьте текст резюме.")
         return
 
-    await storage.save(
-        user_id=user_id,
-        text=extracted_text,
-        source_type="file",
-        source_label=f"файл {filename}",
-    )
+    try:
+        await storage.save(
+            user_id=user_id,
+            text=extracted_text,
+            source_type="file",
+            source_label=f"файл {filename}",
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+        )
+    except Exception:
+        logger.exception("Database error saving document resume for user %s", user_id)
+        await message.answer("Резюме распознано, но не удалось сохранить его в базу данных. Попробуйте позже.")
+        return
 
     await message.answer(
-        f"Резюме из файла «{filename}» сохранено в память ({len(extracted_text)} симв.).\n\n"
+        f"Резюме из файла «{filename}» сохранено ({len(extracted_text)} симв.).\n\n"
         "Теперь отправьте ссылку на вакансию с hh.ru, и я напишу сопроводительное письмо."
     )
 
@@ -181,7 +214,7 @@ async def handle_document(
 async def handle_text(
     message: Message,
     bot: Bot,
-    storage: InMemoryResumeStorage,
+    storage: PostgresResumeStorage,
     generator: CoverLetterGenerator,
 ) -> None:
     if not message.from_user or not message.text:
@@ -194,7 +227,12 @@ async def handle_text(
         await message.answer("Неизвестная команда. Используйте /start, /status, /reset или /help.")
         return
 
-    has_resume = await storage.has_resume(user_id)
+    try:
+        has_resume = await storage.has_resume(user_id)
+    except Exception:
+        logger.exception("Database error checking resume for user %s", user_id)
+        await message.answer("Ошибка при обращении к базе данных. Попробуйте позже.")
+        return
 
     # Scenario 1: New user (no resume stored yet)
     if not has_resume:
@@ -217,14 +255,22 @@ async def handle_text(
                 await status_msg.edit_text(str(exc))
                 return
 
-            await storage.save(
-                user_id=user_id,
-                text=parsed_resume,
-                source_type="hh_url",
-                source_label="ссылка hh.ru",
-            )
+            try:
+                await storage.save(
+                    user_id=user_id,
+                    text=parsed_resume,
+                    source_type="hh_url",
+                    source_label="ссылка hh.ru",
+                    username=message.from_user.username,
+                    full_name=message.from_user.full_name,
+                )
+            except Exception:
+                logger.exception("Database error saving hh.ru resume for user %s", user_id)
+                await status_msg.edit_text("Не удалось сохранить резюме в базу данных. Попробуйте позже.")
+                return
+
             await status_msg.edit_text(
-                f"Резюме с hh.ru распознано и сохранено в память ({len(parsed_resume)} симв.).\n\n"
+                f"Резюме с hh.ru распознано и сохранено ({len(parsed_resume)} симв.).\n\n"
                 "Теперь отправьте ссылку на вакансию с hh.ru, чтобы получить сопроводительное письмо."
             )
             return
@@ -236,19 +282,27 @@ async def handle_text(
             )
             return
 
-        await storage.save(
-            user_id=user_id,
-            text=text,
-            source_type="text",
-            source_label="текстовое резюме",
-        )
+        try:
+            await storage.save(
+                user_id=user_id,
+                text=text,
+                source_type="text",
+                source_label="текстовое резюме",
+                username=message.from_user.username,
+                full_name=message.from_user.full_name,
+            )
+        except Exception:
+            logger.exception("Database error saving text resume for user %s", user_id)
+            await message.answer("Не удалось сохранить резюме в базу данных. Попробуйте позже.")
+            return
+
         await message.answer(
-            f"Резюме сохранено в память ({len(text)} симв.).\n\n"
+            f"Резюме сохранено ({len(text)} симв.).\n\n"
             "Теперь отправьте ссылку на вакансию с hh.ru, и я сгенерирую сопроводительное письмо."
         )
         return
 
-    # Scenario 2: Existing user (resume already in memory -> expects hh.ru vacancy link)
+    # Scenario 2: Existing user (resume already saved -> expects hh.ru vacancy link)
     vacancy_match = extract_hh_vacancy_url(text)
     if not vacancy_match:
         await message.answer(
@@ -259,7 +313,13 @@ async def handle_text(
         return
 
     vacancy_url, vacancy_id = vacancy_match
-    resume_record = await storage.get(user_id)
+    try:
+        resume_record = await storage.get(user_id)
+    except Exception:
+        logger.exception("Database error fetching resume for user %s", user_id)
+        await message.answer("Не удалось загрузить ваше резюме из базы данных. Попробуйте позже.")
+        return
+
     if resume_record is None:
         await message.answer(NEW_USER_WELCOME)
         return
@@ -292,11 +352,18 @@ async def handle_text(
 
 
 @router.message()
-async def handle_unsupported_message(message: Message, storage: InMemoryResumeStorage) -> None:
+async def handle_unsupported_message(message: Message, storage: PostgresResumeStorage) -> None:
     if not message.from_user:
         return
 
-    if await storage.has_resume(message.from_user.id):
+    try:
+        has_resume = await storage.has_resume(message.from_user.id)
+    except Exception:
+        logger.exception("Database error in fallback handler for user %s", message.from_user.id)
+        await message.answer("Пожалуйста, отправьте резюме или ссылку на вакансию с hh.ru.")
+        return
+
+    if has_resume:
         await message.answer(
             "Отправьте текстовую ссылку на вакансию с hh.ru или используйте /reset для обновления резюме."
         )

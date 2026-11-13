@@ -8,27 +8,29 @@ from bot.hh_parser import (
     extract_hh_resume_url,
     extract_hh_vacancy_url,
 )
-from bot.storage import InMemoryResumeStorage
+from bot.storage import normalize_database_url, resolve_ssl_mode
 
 
-class TestResumeStorage(unittest.IsolatedAsyncioTestCase):
-    async def test_save_get_delete(self) -> None:
-        storage = InMemoryResumeStorage()
-        self.assertFalse(await storage.has_resume(101))
+class TestStorageHelpers(unittest.TestCase):
+    def test_normalize_database_url(self) -> None:
+        self.assertEqual(
+            normalize_database_url("postgres://user:pass@host:5432/postgres"),
+            "postgresql://user:pass@host:5432/postgres",
+        )
+        self.assertEqual(
+            normalize_database_url("  postgresql://user:pass@host:5432/postgres  "),
+            "postgresql://user:pass@host:5432/postgres",
+        )
 
-        await storage.save(101, "Python developer, 5 years", "text", "текстовое резюме")
-        self.assertTrue(await storage.has_resume(101))
-
-        record = await storage.get(101)
-        self.assertIsNotNone(record)
-        assert record is not None
-        self.assertEqual(record.text, "Python developer, 5 years")
-        self.assertEqual(await storage.count(), 1)
-
-        deleted = await storage.delete(101)
-        self.assertTrue(deleted)
-        self.assertFalse(await storage.has_resume(101))
-        self.assertFalse(await storage.delete(101))
+    def test_resolve_ssl_mode(self) -> None:
+        self.assertEqual(
+            resolve_ssl_mode("postgresql://u:p@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"),
+            "require",
+        )
+        self.assertEqual(
+            resolve_ssl_mode("postgresql://u:p@localhost:5432/postgres?sslmode=disable"),
+            False,
+        )
 
 
 class TestHHParser(unittest.TestCase):
@@ -57,7 +59,6 @@ class TestHHParser(unittest.TestCase):
           </body>
         </html>
         """
-        # Only run if bs4 & lxml are installed in current Python environment
         try:
             vacancy = _parse_vacancy_html(sample_html, "https://hh.ru/vacancy/999", "999")
         except Exception:

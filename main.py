@@ -11,7 +11,7 @@ from aiogram.types import BotCommand
 from bot.config import Settings, load_settings
 from bot.gemini_service import CoverLetterGenerator
 from bot.handlers import router
-from bot.storage import InMemoryResumeStorage
+from bot.storage import PostgresResumeStorage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,14 +20,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def _start_healthcheck_server(port: int, storage: InMemoryResumeStorage) -> web.AppRunner:
+async def _start_healthcheck_server(port: int, storage: PostgresResumeStorage) -> web.AppRunner:
     """Lightweight JSON-only HTTP endpoint so Hugging Face Spaces marks the Docker Space as healthy."""
 
     async def health_handler(_request: web.Request) -> web.Response:
+        try:
+            saved_resumes = await storage.count()
+            db_status = "connected"
+        except Exception:
+            logger.exception("Healthcheck database query failed")
+            saved_resumes = None
+            db_status = "error"
+
         return web.json_response(
             {
-                "status": "ok",
-                "active_resumes_in_memory": await storage.count(),
+                "status": "ok" if db_status == "connected" else "degraded",
+                "database": db_status,
+                "saved_resumes": saved_resumes,
             }
         )
 
@@ -55,7 +64,10 @@ async def _set_bot_commands(bot: Bot) -> None:
 
 
 async def run_bot(settings: Settings) -> None:
-    storage = InMemoryResumeStorage()
+    storage = PostgresResumeStorage(settings.database_url)
+    await storage.init()
+    logger.info("Connected to Supabase PostgreSQL and ensured user_resumes table exists")
+
     generator = CoverLetterGenerator(
         api_key=settings.gemini_api_key,
         model_name=settings.model_name,
@@ -81,6 +93,7 @@ async def run_bot(settings: Settings) -> None:
     finally:
         await health_runner.cleanup()
         await bot.session.close()
+        await storage.close()
 
 
 def main() -> None:
