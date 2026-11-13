@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from bot.config import Settings
 from bot.hh_parser import (
     _parse_vacancy_api_json,
     _parse_vacancy_html,
@@ -9,6 +10,30 @@ from bot.hh_parser import (
     extract_hh_vacancy_url,
 )
 from bot.storage import normalize_database_url, resolve_ssl_mode
+
+
+class TestConfigHelpers(unittest.TestCase):
+    def test_webhook_mode_selection(self) -> None:
+        webhook_settings = Settings(
+            telegram_bot_token="123:abc",
+            gemini_api_key="gem",
+            database_url="postgresql://u:p@h:5432/db",
+            webhook_base_url="https://cover-letter-bot-9lvx.onrender.com", # Random url for exemple
+            bot_mode="auto",
+        )
+        self.assertTrue(webhook_settings.use_webhook)
+        self.assertEqual(webhook_settings.webhook_url,
+            "https://cover-letter-bot-9lvx.onrender.com/webhook", # Random url for exemple
+        )
+
+        polling_override = Settings(
+            telegram_bot_token="123:abc",
+            gemini_api_key="gem",
+            database_url="postgresql://u:p@h:5432/db",
+            webhook_base_url="https://cover-letter-bot-9lvx.onrender.com", # Random url for exemple
+            bot_mode="polling",
+        )
+        self.assertFalse(polling_override.use_webhook)
 
 
 class TestStorageHelpers(unittest.TestCase):
